@@ -13,24 +13,24 @@ function httpError(status, message, extra = {}) {
 async function joinQueue({ name, phoneNumber, serviceType, priority }) {
   if (!name || !serviceType) throw httpError(400, 'name and service_type are required');
 
-  return withTransaction(async (conn) => {
+  return withTransaction((db) => {
     // create customer
-    const [custRes] = await conn.execute(
-      `INSERT INTO customers (name, phone_number) VALUES (?, ?)`,
-      [name, phoneNumber || null]
-    );
-    const customerId = custRes.insertId;
+    const custStmt = db.prepare(`INSERT INTO customers (name, phone_number) VALUES (?, ?)`);
+    const custInfo = custStmt.run(name, phoneNumber || null);
+    const customerId = custInfo.lastInsertRowid;
 
     // create ticket (ticket_number will be set to id for a guaranteed unique sequence)
-    const [ticketRes] = await conn.execute(
-      `INSERT INTO tickets (customer_id, ticket_number, service_type, priority)
-       VALUES (?, ?, ?, ?)`,
-      [customerId, 0, serviceType, Number(priority || 0)]
+    const ticketStmt = db.prepare(
+      `INSERT INTO tickets (customer_id, ticket_number, service_type, priority) VALUES (?, ?, ?, ?)`
     );
-    const ticketId = ticketRes.insertId;
-    await conn.execute(`UPDATE tickets SET ticket_number = ? WHERE id = ?`, [ticketId, ticketId]);
+    const ticketInfo = ticketStmt.run(customerId, 0, serviceType, Number(priority || 0));
+    const ticketId = ticketInfo.lastInsertRowid;
 
-    const ticket = await ticketModel.getTicketById(ticketId);
+    // Update ticket_number to match id
+    db.prepare(`UPDATE tickets SET ticket_number = ? WHERE id = ?`).run(ticketId, ticketId);
+
+    // Return the ticket
+    const ticket = db.prepare(`SELECT * FROM tickets WHERE id = ?`).get(ticketId);
     return ticket;
   });
 }
@@ -62,101 +62,63 @@ async function getTicketStatus(ticketId) {
 }
 
 async function callTicket({ ticketId, counterId }) {
-  return withTransaction(async (conn) => {
-    const [rows] = await conn.execute(
-      `SELECT id, status
-       FROM tickets
-       WHERE id = ?
-       FOR UPDATE`,
-      [ticketId]
-    );
-    const row = rows[0];
+  return withTransaction((db) => {
+    const row = db.prepare(`SELECT id, status FROM tickets WHERE id = ?`).get(ticketId);
     if (!row) throw httpError(404, 'Ticket not found');
     if (row.status !== 'waiting') throw httpError(409, `Ticket is not waiting (status=${row.status})`);
 
-    await conn.execute(
-      `UPDATE tickets
-       SET status = 'called', counter_id = ?, called_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [counterId || null, ticketId]
-    );
+    db.prepare(
+      `UPDATE tickets SET status = 'called', counter_id = ?, called_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(counterId || null, ticketId);
 
-    return ticketModel.getTicketById(ticketId);
+    return db.prepare(`SELECT * FROM tickets WHERE id = ?`).get(ticketId);
   });
 }
 
 async function serveTicket({ ticketId }) {
-  return withTransaction(async (conn) => {
-    const [rows] = await conn.execute(
-      `SELECT id, status
-       FROM tickets
-       WHERE id = ?
-       FOR UPDATE`,
-      [ticketId]
-    );
-    const row = rows[0];
+  return withTransaction((db) => {
+    const row = db.prepare(`SELECT id, status FROM tickets WHERE id = ?`).get(ticketId);
     if (!row) throw httpError(404, 'Ticket not found');
     if (row.status !== 'called') throw httpError(409, `Ticket is not called (status=${row.status})`);
 
-    await conn.execute(
-      `UPDATE tickets
-       SET status = 'served', served_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [ticketId]
-    );
-    return ticketModel.getTicketById(ticketId);
+    db.prepare(
+      `UPDATE tickets SET status = 'served', served_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(ticketId);
+
+    return db.prepare(`SELECT * FROM tickets WHERE id = ?`).get(ticketId);
   });
 }
 
 async function cancelTicket({ ticketId }) {
-  return withTransaction(async (conn) => {
-    const [rows] = await conn.execute(
-      `SELECT id, status
-       FROM tickets
-       WHERE id = ?
-       FOR UPDATE`,
-      [ticketId]
-    );
-    const row = rows[0];
+  return withTransaction((db) => {
+    const row = db.prepare(`SELECT id, status FROM tickets WHERE id = ?`).get(ticketId);
     if (!row) throw httpError(404, 'Ticket not found');
     if (row.status === 'served') throw httpError(409, 'Cannot cancel a served ticket');
 
-    await conn.execute(`UPDATE tickets SET status = 'cancelled' WHERE id = ?`, [ticketId]);
-    return ticketModel.getTicketById(ticketId);
+    db.prepare(`UPDATE tickets SET status = 'cancelled' WHERE id = ?`).run(ticketId);
+    return db.prepare(`SELECT * FROM tickets WHERE id = ?`).get(ticketId);
   });
 }
 
 async function callNext({ counterId, serviceType }) {
-  return withTransaction(async (conn) => {
-    // lock next waiting ticket to avoid double-calls
+  return withTransaction((db) => {
+    // Find next waiting ticket
+    let sql = `SELECT id FROM tickets WHERE status = 'waiting'`;
     const params = [];
-    let where = `status = 'waiting'`;
     if (serviceType) {
-      where += ` AND service_type = ?`;
+      sql += ` AND service_type = ?`;
       params.push(serviceType);
     }
+    sql += ` ORDER BY priority DESC, created_at ASC LIMIT 1`;
 
-    const [rows] = await conn.execute(
-      `SELECT id
-       FROM tickets
-       WHERE ${where}
-       ORDER BY priority DESC, created_at ASC
-       LIMIT 1
-       FOR UPDATE`,
-      params
-    );
-
-    const next = rows[0];
+    const next = db.prepare(sql).get(...params);
     if (!next) return null;
 
-    await conn.execute(
-      `UPDATE tickets
-       SET status = 'called', counter_id = ?, called_at = CURRENT_TIMESTAMP
-       WHERE id = ?`,
-      [counterId || null, next.id]
-    );
+    db.prepare(
+      `UPDATE tickets SET status = 'called', counter_id = ?, called_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).run(counterId || null, next.id);
 
-    return ticketModel.getTicketById(next.id);
+    return db.prepare(`SELECT * FROM tickets WHERE id = ?`).get(next.id);
   });
 }
 
