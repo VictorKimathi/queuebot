@@ -1,48 +1,43 @@
-const mysql = require('mysql2/promise');
+const Database = require('better-sqlite3');
+const path = require('path');
 
-let pool;
+const dbPath = path.join(__dirname, '../../queue_system.db');
+const db = new Database(dbPath);
 
-function getPool() {
-  if (pool) return pool;
-
-  pool = mysql.createPool({
-    host: process.env.DB_HOST || 'localhost',
-    port: Number(process.env.DB_PORT || 3306),
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'queue_system',
-    waitForConnections: true,
-    connectionLimit: Number(process.env.DB_POOL_LIMIT || 10),
-    queueLimit: 0,
-    timezone: 'Z',
-  });
-
-  return pool;
-}
+// Enable WAL mode for better concurrency
+db.pragma('journal_mode = WAL');
 
 async function query(sql, params = []) {
-  const [rows] = await getPool().execute(sql, params);
-  return rows;
+  return new Promise((resolve, reject) => {
+    try {
+      const upperSql = sql.trim().toUpperCase();
+      const stmt = db.prepare(sql);
+      if (upperSql.startsWith('SELECT') || upperSql.startsWith('PRAGMA')) {
+        const rows = stmt.all(params);
+        resolve(rows);
+      } else {
+        const info = stmt.run(params);
+        resolve({ insertId: info.lastInsertRowid, affectedRows: info.changes });
+      }
+    } catch (err) {
+      reject(err);
+    }
+  });
 }
 
 async function withTransaction(fn) {
-  const conn = await getPool().getConnection();
-  try {
-    await conn.beginTransaction();
-    const result = await fn(conn);
-    await conn.commit();
-    return result;
-  } catch (err) {
+  return new Promise((resolve, reject) => {
     try {
-      await conn.rollback();
-    } catch (_) {
-      // ignore rollback errors
+      const transaction = db.transaction(() => {
+        return fn(db);
+      });
+      const result = transaction();
+      resolve(result);
+    } catch (err) {
+      reject(err);
     }
-    throw err;
-  } finally {
-    conn.release();
-  }
+  });
 }
 
-module.exports = { getPool, query, withTransaction };
+module.exports = { query, withTransaction };
 
